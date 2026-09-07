@@ -257,7 +257,26 @@ partial def getInstanceTypes (e : Expr) : MetaM (HashSet Expr) := do
   | mdata _ b | lam _ _ b _ | letE _ _ _ b _ => getInstanceTypes b
   | _ => return ∅
 
-/-- Find all possible ways to unify each element in `todo` with elements of `candidates`, and accumulate the result of `cb` on each. -/
+/-- The carrier types of the candidate instances: their type-valued arguments without
+metavariables, without duplicates. -/
+def candidateCarriers (candidates : List UnivAbstracted) : MetaM (Array Expr) := do
+  let mut out : Array Expr := #[]
+  for inst in candidates do
+    let args ← withoutModifyingMCtx do
+      let (_, _, inst) ← lambdaMetaTelescope
+        (inst.expr.instantiateLevelParams inst.levels (← mkFreshLevelMVars inst.levels.length))
+      inst.getAppArgs.filterM fun a => do
+        let a ← instantiateMVars a
+        return !a.hasMVar && (← isType a)
+    for a in args do
+      if !out.contains a then out := out.push a
+  return out
+
+/-- Find all possible ways to unify each element in `todo` with elements of `candidates`, and accumulate the result of `cb` on each.
+
+When no candidate has the class of a `todo` type, its carrier argument is instead unified with
+the carrier types of the candidates, and the instance is left to synthesis in `cb`: a goal
+offering `LinearOrder ℝ` then also supplies a premise that needs `Preorder ℝ`. -/
 partial def unifyWithCand (todo : List Expr) (candidates : List UnivAbstracted) (cb : MonoM (Option Expr)) : MonoM (List Expr) := do
   match todo with
   | [] => return (← cb).toList
@@ -277,6 +296,18 @@ partial def unifyWithCand (todo : List Expr) (candidates : List UnivAbstracted) 
           else return none
       if !branches.isEmpty then
         return branches.flatten
+      -- No candidate has this class: try each carrier type for the first type argument.
+      let typeMVars ← type.getAppArgs.filterM fun a => do
+        let a ← instantiateMVars a
+        return a.isMVar && (← isType a)
+      if let some m := typeMVars[0]? then
+        let branches ← (← candidateCarriers candidates).toList.filterMapM fun carrier =>
+          withoutModifyingMCtx do
+            if ← isDefEqGuarded m carrier then
+              return some (← unifyWithCand todo candidates cb)
+            else return none
+        if !branches.isEmpty then
+          return branches.flatten
     -- If there is no unification, we continue anyway.
     unifyWithCand todo candidates cb
 
@@ -299,7 +330,8 @@ def monomorphizeConst (name : Name) : MonoM (List Expr) := do
   let instImplicitTypes ← instImplicit.mapM fun mvar => do mvar.mvarId!.getType
   let todo := (← getInstanceTypes body).insertMany instImplicitTypes.toList
   withOptions (backward.isDefEq.respectTransparency.set · false) do
-  unifyWithCand todo.toList (← get).candidateInsts.toList do
+  -- Different unification branches can produce the same copy.
+  (·.eraseDups) <$> unifyWithCand todo.toList (← get).candidateInsts.toList do
     for mvar in instImplicit do
       let mty ← instantiateMVars (← mvar.mvarId!.getType)
       match ← trySynthInstance mty with
@@ -386,10 +418,21 @@ def monomorphizeTactic (goal : MVarId) (ids : Array Syntax) (config : MonoConfig
     -- where the symbols and copies exist.
     let (type, lctx) ← goal.withContext <| transformMVar goal
       (fun e => Meta.transform e (pre := monoTransformStep)) (skipValue := symFVars.contains)
-    -- Failsafe for new `monos` being added during the second pass.
-    let _ ← finalizeMonos
     let _ ← goal.modifyLCtx fun _ => lctx
     -- The types of existing free variables changed: cached inferred types are stale.
     resetCache
+
+    -- Note the symbols first found in this pass (operations occurring in a premise copy
+    -- but not in the goal); their occurrences are metavariables that now instantiate to
+    -- the new local definitions.
+    for (_, monos) in (← get).mono.toList do
+      for mono in monos do
+        if ← mono.id.isAssigned then continue
+        let name := ((← getMCtx).getDecl mono.id).userName
+        let noteResult ← noteSymbol goal name (mono.assignment.expr.instantiateLevelParams mono.assignment.levels (mono.assignment.levels.map (fun _ => Level.zero))) config.defs
+        mono.id.assign (.fvar noteResult.1)
+        goal := noteResult.2
+    -- Failsafe: assign any symbol that is still unassigned to its definition.
+    let _ ← finalizeMonos
     goal.replaceTargetDefEq type
   else return goal
