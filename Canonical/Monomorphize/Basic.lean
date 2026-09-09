@@ -280,6 +280,33 @@ partial def unifyWithCand (todo : List Expr) (candidates : List UnivAbstracted) 
     -- If there is no unification, we continue anyway.
     unifyWithCand todo candidates cb
 
+/-- Discharge the universe constraints that unification postponed. A constraint with several
+solutions, such as `max ?u ?v =?= u`, is first tried with every metavariable of one side set to
+the other side (`v := u`, the choice authors make). A constraint that still does not hold is
+dropped: its metavariables stay unassigned and become universe parameters of the copy, so that
+a later unification against a use can still instantiate them, instead of the tactic aborting. -/
+def settleUniverses : MetaM Unit := do
+  -- Constraints left behind by discarded unification branches mention metavariables that
+  -- no longer exist; drop them first.
+  let mctx ← getMCtx
+  let live ← (← getResetPostponed).toList.filterM fun p => do
+    return ((p.lhs.collectMVars {}).toList ++ (p.rhs.collectMVars {}).toList).all fun m =>
+      (mctx.findLevelDepth? m).isSome
+  setPostponed (live.foldl (·.push ·) {})
+  if ← processPostponed (mayPostpone := false) then return
+  for p in ← getResetPostponed do
+    let ok ← withoutModifyingState do
+      let (mvarSide, other) := if p.lhs.hasMVar && !p.rhs.hasMVar then (p.lhs, p.rhs)
+        else if p.rhs.hasMVar && !p.lhs.hasMVar then (p.rhs, p.lhs) else (p.lhs, p.rhs)
+      if other.hasMVar then return false
+      for m in (mvarSide.collectMVars {}).toList do
+        assignLevelMVar m other
+      isLevelDefEq p.lhs p.rhs
+    if ok then
+      let (mvarSide, other) := if p.lhs.hasMVar && !p.rhs.hasMVar then (p.lhs, p.rhs) else (p.rhs, p.lhs)
+      for m in (mvarSide.collectMVars {}).toList do
+        assignLevelMVar m other
+
 /-- Generates all monomorphizations for a given constant. -/
 def monomorphizeConst (name : Name) : MonoM (List Expr) := do
   -- First, get the instance implicit arguments of the constant.
@@ -307,6 +334,7 @@ def monomorphizeConst (name : Name) : MonoM (List Expr) := do
       | .none => return none
       | .undef => pure ()
 
+    settleUniverses
     let appliedExpr := mkAppN (Expr.const name levels) mvars
     let instantiated ← instantiateMVars appliedExpr
     let abstrResult ← abstractMVarsInst instantiated
@@ -369,6 +397,7 @@ def monomorphizeTactic (goal : MVarId) (ids : Array Syntax) (config : MonoConfig
     pure (← MVarId.note goal name result).2
   ) goal
 
+  settleUniverses
   -- Canonicalize by noting the `monos`.
   if config.canonicalize then
     let mut symFVars : HashSet FVarId := {}
